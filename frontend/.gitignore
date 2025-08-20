@@ -1,5 +1,16 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
+# .gitignore (Root)
+node_modules/
+.env
+.env.local
+frontend/.env
+frontend/.env.local
+build/
+dist/
+frontend/build/
+frontend/dist/
+
 # dependencies
 /node_modules
 /.pnp
