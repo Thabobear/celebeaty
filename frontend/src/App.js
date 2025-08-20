@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 
 // === Backend/WS aus Env (Vercel/Vite) ===
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:3001";
 const WS_URL = BACKEND_URL.replace(/^http/, "ws");
 
 // === Poll/Thresholds ===
