@@ -1,38 +1,100 @@
-.App {
-  text-align: center;
+:root{
+  --bg:#0f1115;
+  --card:#171a21;
+  --muted:#13161c;
+  --text:#e7eaf0;
+  --sub:#a8b0c0;
+  --brand:#1db954;
+  --border:#252a34;
+  --danger:#e5534b;
+  --warn:#f0b429;
 }
 
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
+*{box-sizing:border-box}
+html,body,#root{height:100%}
+body{
+  margin:0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  background: radial-gradient(1200px 800px at 80% -10%, #1db95420, transparent 60%), var(--bg);
+  color:var(--text);
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
-  }
+.layout{min-height:100%; display:flex; flex-direction:column}
+.header{
+  display:flex; align-items:center; gap:12px;
+  padding:16px 20px; border-bottom:1px solid var(--border);
+  background: rgba(0,0,0,0.35); backdrop-filter: blur(6px);
+  position:sticky; top:0; z-index:10;
+}
+.brand{display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:0.2px}
+.logoDot{width:10px; height:10px; border-radius:50%; background:var(--brand); box-shadow:0 0 16px #1db954aa}
+.spacer{flex:1}
+.user{display:flex; align-items:center; gap:10px}
+.avatar{
+  width:28px; height:28px; border-radius:50%; background:#2a2f3a; display:grid; place-items:center;
+  font-weight:700; color:#dfe5ef; border:1px solid var(--border)
+}
+.userName{opacity:0.9}
+
+.main{max-width:980px; margin:24px auto; padding: 0 16px 40px}
+
+.card{
+  background: var(--card); border:1px solid var(--border); border-radius:14px;
+  padding:18px; box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+}
+.card.muted{background: var(--muted)}
+
+.section{margin:18px 0}
+.sectionHead{display:flex; align-items:end; gap:10px; margin-bottom:8px}
+.sectionHead h2{margin:0}
+.sectionHead small{color:var(--sub)}
+
+.row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+
+.btn{
+  background:#1b1f27; color:var(--text); border:1px solid var(--border);
+  border-radius:10px; padding:10px 14px; cursor:pointer;
+}
+.btn:hover{border-color:#343b49}
+.btn.primary{
+  background: var(--brand); color:#0d0f12; border-color: transparent; font-weight:700;
+}
+.btn.primary:hover{filter:brightness(1.05)}
+.btn.ghost{background: transparent}
+
+.hint{
+  background: #1d1f26; border:1px dashed #2a303d; padding:10px 12px; border-radius:10px;
+  color:#cdd5e6; margin-bottom:12px;
 }
 
-.App-header {
-  background-color: #282c34;
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  font-size: calc(10px + 2vmin);
-  color: white;
+.grid{display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap:12px}
+.roomCard{
+  border:1px solid var(--border); background: var(--card); border-radius:12px; padding:12px;
+}
+.roomHeader{display:flex; gap:10px; align-items:center}
+.roomMeta{flex:1}
+.roomName{font-weight:700}
+.roomSince{color:var(--sub); font-size:12px}
+.dot{width:8px; height:8px; border-radius:999px; background:#666}
+.dot.live{background:#ff5370; box-shadow:0 0 10px #ff537080}
+
+.roomActions{margin-top:10px; display:flex; gap:8px}
+
+.liveBadge{
+  display:inline-block; background:#ff5370; color:white; font-weight:800;
+  font-size:11px; padding:4px 8px; border-radius:999px; letter-spacing:0.4px; margin-bottom:8px;
+  box-shadow:0 0 12px #ff537060;
 }
 
-.App-link {
-  color: #61dafb;
-}
+.np{}
+.npHead h3{margin:0 0 8px 0}
+.npBody{display:flex; gap:12px; align-items:center}
+.cover{width:84px; height:84px; border-radius:10px; object-fit:cover; border:1px solid var(--border)}
+.meta .title{font-weight:700}
+.meta .artist{color:var(--sub)}
+.meta .time{color:var(--sub); font-variant-numeric: tabular-nums}
 
-@keyframes App-logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+.footer{
+  margin-top:auto; padding:16px 20px; border-top:1px solid var(--border); color:var(--sub);
+  display:flex; justify-content:center; background: rgba(0,0,0,0.2);
 }
