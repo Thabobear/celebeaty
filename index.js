@@ -1,368 +1,254 @@
-// index.js — Backend (Render-ready, Port aus Env; robust + Directory + WS keepalive)
-require("dotenv").config();
+/**
+ * Celebeaty Backend (Express + WebSocket)
+ * - OAuth Login zu Spotify (Authorization Code)
+ * - /callback tauscht Code -> Access Token, leitet mit ?access_token=... ins Frontend
+ * - /whoami ruft Spotify /me ab (mit erweiterten Scopes)
+ * - /currently-playing ruft aktuell gespielten Track ab
+ * - WebSocket broadcastet Presence & Track-Events
+ *
+ * ENV (Render / lokal .env):
+ *   SPOTIFY_CLIENT_ID=...
+ *   SPOTIFY_CLIENT_SECRET=...
+ *   REDIRECT_URI=https://celebeaty.onrender.com/callback   (oder ngrok)
+ *   FRONTEND_URI=https://<deine-frontend-domain>           (vercel oder localhost)
+ *   CORS_ORIGIN=https://<deine-frontend-domain>[,https://weitere.domain]
+ *   PORT=3001  (lokal; Render setzt selbst)
+ *   NODE_ENV=production|development
+ */
+
 const express = require("express");
-const fetch = require("node-fetch"); // npm i node-fetch@2
+const axios = require("axios");
 const cors = require("cors");
-const cookieParser = require("cookie-parser");
-const querystring = require("querystring");
+const path = require("path");
 const http = require("http");
-const { WebSocketServer } = require("ws");
+const WebSocket = require("ws");
+require("dotenv").config();
 
 const app = express();
 
-// --- CORS: Prod eng, Dev weit ---
-const allow = process.env.CORS_ORIGIN?.split(",").map(s => s.trim()).filter(Boolean);
-app.use(cors({ origin: allow && allow.length ? allow : "*"}));
+// ---------- CORS ----------
+const corsOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // z.B. Curl/Postman
+      if (corsOrigins.length === 0) return cb(null, true);
+      if (corsOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked for origin ${origin}`));
+    },
+    credentials: false, // wir setzen aktuell keine Cookies
+  })
+);
 
 app.use(express.json());
-app.use(cookieParser());
 
-// --- Mini-Logger ---
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-  next();
+// Optional: statische Dateien (falls du ein kleines Landing im /public hast)
+app.use(express.static(path.join(__dirname, "public")));
+
+// ---------- Health ----------
+app.get("/health", (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
 });
 
-// ===== Spotify Config =====
-const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI;      // e.g. https://api.celebeaty.com/callback
-const FRONTEND_URI = process.env.FRONTEND_URI || "http://localhost:5173";
+// ---------- Spotify Login ----------
+function buildAuthUrl({ forceDialog = false } = {}) {
+  const scope = [
+    "user-read-playback-state",
+    "user-read-currently-playing",
+    "user-modify-playback-state",
+    "user-read-email",
+    "user-read-private",
+  ].join(" ");
 
-// ===== Helpers =====
-function rand(n) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let s = ""; for (let i = 0; i < n; i++) s += chars[Math.floor(Math.random() * chars.length)];
-  return s;
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: process.env.SPOTIFY_CLIENT_ID,
+    scope,
+    redirect_uri: process.env.REDIRECT_URI,
+  });
+
+  if (forceDialog) {
+    params.set("show_dialog", "true");
+  }
+
+  return `https://accounts.spotify.com/authorize?${params.toString()}`;
 }
-const parseJsonSafe = (txt) => {
-  if (!txt || !txt.trim()) return null;
-  try { return JSON.parse(txt); } catch { return null; }
-};
 
-// ===== Auth Flows =====
 app.get("/login", (req, res) => {
-  const state = rand(16);
-  res.cookie("spotify_auth_state", state);
-  const scope = "user-read-playback-state user-read-currently-playing user-modify-playback-state";
-  const authUrl =
-    "https://accounts.spotify.com/authorize?" +
-    querystring.stringify({
-      response_type: "code",
-      client_id: CLIENT_ID,
-      scope,
-      redirect_uri: REDIRECT_URI,
-      state,
-    });
-  res.redirect(authUrl);
+  res.redirect(buildAuthUrl({ forceDialog: false }));
 });
 
-app.get("/force-login", (_req, res) => {
-  res.clearCookie("spotify_auth_state");
-  res.redirect("/login");
+// Expliziter Account-Wechsel (zeigt Login-Auswahl)
+app.get("/force-login", (req, res) => {
+  res.redirect(buildAuthUrl({ forceDialog: true }));
 });
 
+// ---------- Spotify Callback: Code -> Token ----------
 app.get("/callback", async (req, res) => {
-  const code = req.query.code || null;
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Missing 'code'");
+
   try {
-    const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
-      },
-      body: querystring.stringify({
+    const tokenRes = await axios.post(
+      "https://accounts.spotify.com/api/token",
+      new URLSearchParams({
         grant_type: "authorization_code",
         code,
-        redirect_uri: REDIRECT_URI,
+        redirect_uri: process.env.REDIRECT_URI,
+        client_id: process.env.SPOTIFY_CLIENT_ID,
+        client_secret: process.env.SPOTIFY_CLIENT_SECRET,
       }),
-    });
-    const tokenJson = await tokenRes.json();
-    if (tokenJson.error) {
-      console.error("Token Error:", tokenJson);
-      return res.status(400).json(tokenJson);
-    }
-    const url =
-      FRONTEND_URI +
-      "/?access_token=" +
-      encodeURIComponent(tokenJson.access_token) +
-      (tokenJson.refresh_token ? "&refresh_token=" + encodeURIComponent(tokenJson.refresh_token) : "");
-    res.redirect(url);
-  } catch (e) {
-    console.error("Callback error:", e);
-    res.status(500).json({ error: "callback_error" });
-  }
-});
-
-app.get("/refresh_token", async (req, res) => {
-  const refresh_token = req.query.refresh_token;
-  if (!refresh_token) return res.status(400).json({ error: "no_refresh_token" });
-  try {
-    const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
-      },
-      body: querystring.stringify({
-        grant_type: "refresh_token",
-        refresh_token,
-      }),
-    });
-    const tokenJson = await tokenRes.json();
-    res.json(tokenJson);
-  } catch (e) {
-    console.error("refresh_token error:", e);
-    res.status(500).json({ error: "refresh_error" });
-  }
-});
-
-// ===== WhoAmI =====
-app.get("/whoami", async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) return res.status(401).json({ error: "No token" });
-    const r = await fetch("https://api.spotify.com/v1/me", {
-      headers: { Authorization: "Bearer " + token },
-    });
-    const txt = await r.text().catch(() => "");
-    if (!r.ok) {
-      console.error("whoami fail:", r.status, txt);
-      return res.status(r.status).json({ error: "whoami_failed", status: r.status, body: txt });
-    }
-    const j = parseJsonSafe(txt);
-    res.json({
-      id: j?.id,
-      name: j?.display_name || j?.id || "Unbekannt",
-      avatar: (j?.images && j.images[0]?.url) || null,
-    });
-  } catch (e) {
-    console.error("whoami exception:", e);
-    res.status(500).json({ error: "whoami_exception", details: String(e) });
-  }
-});
-
-// ===== Currently Playing (robust) =====
-app.get("/currently-playing", async (req, res) => {
-  const token = req.headers["authorization"]?.split(" ")[1];
-  if (!token) return res.status(400).json({ error: "No token provided" });
-
-  const headers = { Authorization: "Bearer " + token, Accept: "application/json" };
-
-  try {
-    const r = await fetch(
-      "https://api.spotify.com/v1/me/player/currently-playing?market=from_token&additional_types=track,episode",
-      { headers }
+      {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      }
     );
 
-    if (r.status === 204) {
-      const r2 = await fetch("https://api.spotify.com/v1/me/player", { headers });
-      const txt2 = await r2.text().catch(() => "");
-      const j2 = parseJsonSafe(txt2);
-      const hasDevice = !!(j2?.device || (Array.isArray(j2?.devices) && j2.devices.length));
-      return res.json({
-        is_playing: false,
-        reason: hasDevice ? "no_item" : "no_active_device",
-        message: hasDevice ? "Kein Song läuft (204)." : "Kein aktives Gerät. Öffne Spotify am Sender.",
-      });
+    const { access_token /*, refresh_token, expires_in */ } = tokenRes.data || {};
+    if (!access_token) {
+      return res.status(500).json({ error: "No access_token from Spotify", details: tokenRes.data });
     }
 
-    const txt = await r.text().catch(() => "");
-    const j = parseJsonSafe(txt);
+    // Redirect ins Frontend – Access Token in Query
+    const front = process.env.FRONTEND_URI || "http://localhost:3000";
+    const redirectTo = `${front.replace(/\/+$/, "")}/?access_token=${encodeURIComponent(access_token)}`;
+    return res.redirect(redirectTo);
+  } catch (err) {
+    console.error("Token exchange failed:", err.response?.data || err.message);
+    return res
+      .status(500)
+      .json({ error: "Token exchange failed", details: err.response?.data || err.message });
+  }
+});
 
-    if (!j) {
-      const r2 = await fetch("https://api.spotify.com/v1/me/player", { headers });
-      const txt2 = await r2.text().catch(() => "");
-      const j2 = parseJsonSafe(txt2);
-      return res.json({
-        is_playing: !!j2?.is_playing,
-        reason: "empty_response",
-        message: "Leere Antwort von currently-playing – erneut versuchen.",
-        device_active: !!j2?.device,
-      });
+// ---------- Helper: Spotify API Call ----------
+async function spotifyGet(url, token) {
+  const r = await axios.get(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    validateStatus: () => true,
+  });
+  return r;
+}
+
+// ---------- Who am I ----------
+app.get("/whoami", async (req, res) => {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!token) return res.status(401).json({ error: "No token provided" });
+
+  try {
+    const r = await spotifyGet("https://api.spotify.com/v1/me", token);
+    if (r.status === 401) {
+      return res.status(401).json({ error: "unauthorized" });
     }
-
-    if (!j.item) {
-      const type = j.currently_playing_type || "unknown";
-      return res.json({
-        is_playing: !!j.is_playing,
-        reason: type === "ad" ? "ad" : "no_item",
-        message: type === "ad"
-          ? "Werbung läuft – warte bis ein Song startet."
-          : "Kein item. Evtl. Private Session aktiv oder Werbung.",
-        type,
-      });
+    if (r.status >= 400) {
+      return res.status(r.status).json({ error: "spotify_error", details: r.data });
     }
-
-    const type = j.currently_playing_type;
-    const base = {
-      is_playing: !!j.is_playing,
-      progress_ms: j.progress_ms ?? 0,
-      type,
-    };
-
-    if (type === "track") {
-      const it = j.item;
-      return res.json({
-        ...base,
-        track: {
-          id: it.id,
-          name: it.name,
-          artists: it.artists?.map((a) => a.name) || [],
-          album: {
-            name: it.album?.name,
-            images: it.album?.images || [],
-            spotify_url: it.album?.external_urls?.spotify,
-          },
-          spotify_url: it.external_urls?.spotify,
-          duration_ms: it.duration_ms,
-        },
-      });
-    }
-
-    if (type === "episode") {
-      const ep = j.item;
-      return res.json({
-        ...base,
-        track: {
-          id: ep.id,
-          name: ep.name,
-          artists: [ep.show?.publisher || ep.show?.name || "Podcast"],
-          album: {
-            name: ep.show?.name,
-            images: ep.images || ep.show?.images || [],
-            spotify_url: ep.external_urls?.spotify,
-          },
-          spotify_url: ep.external_urls?.spotify,
-          duration_ms: ep.duration_ms,
-        },
-      });
-    }
-
+    const j = r.data || {};
     return res.json({
-      ...base,
-      reason: "unsupported_type",
-      message: `Nicht unterstützter Typ: ${type || "unbekannt"}`,
+      id: j.id,
+      display_name: j.display_name || null,
+      email: j.email || null,
+      country: j.country || null,
+      product: j.product || null,
     });
   } catch (e) {
-    console.error("currently-playing error (caught):", e);
-    res.status(200).json({
-      is_playing: false,
-      reason: "fetch_error",
-      message: "Spotify antwortete nicht sauber. Bitte erneut versuchen.",
-    });
+    console.error("whoami error:", e.message);
+    return res.status(500).json({ error: "whoami_failed" });
   }
 });
 
-// ===== HTTP + WS =====
+// ---------- Currently Playing ----------
+app.get("/currently-playing", async (req, res) => {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!token) return res.status(401).json({ error: "No token provided" });
+
+  try {
+    const r = await spotifyGet("https://api.spotify.com/v1/me/player/currently-playing", token);
+
+    if (r.status === 204 || !r.data) {
+      return res.json({ message: "Kein Song wird gerade gespielt.", reason: "no_item" });
+    }
+    if (r.status === 200 && r.data) {
+      const data = r.data;
+      const item = data.item;
+
+      if (!item) {
+        // Werbung / Private Session usw.
+        return res.json({
+          message: "Kein item. Evtl. Werbung oder private session.",
+          reason: data.currently_playing_type || "no_item",
+        });
+      }
+
+      return res.json({
+        is_playing: !!data.is_playing,
+        progress_ms: data.progress_ms || 0,
+        track: {
+          id: item.id,
+          name: item.name,
+          artists: (item.artists || []).map((a) => a.name),
+          album: {
+            name: item.album?.name,
+            images: item.album?.images || [],
+            spotify_url: item.album?.external_urls?.spotify || null,
+          },
+          spotify_url: item.external_urls?.spotify || null,
+          duration_ms: item.duration_ms || 0,
+        },
+      });
+    }
+
+    // Andere Fehler-Codes von Spotify
+    return res.status(r.status).json({ error: "spotify_error", details: r.data });
+  } catch (e) {
+    console.error("currently-playing error:", e.response?.data || e.message);
+    return res.status(500).json({ error: "currently_playing_failed" });
+  }
+});
+
+// ---------- Catch-all (optional, falls du ohne eigenes Frontend-Hosting testen willst) ----------
+app.get("/", (req, res) => {
+  res.send(`
+    <html>
+      <head><title>Celebeaty API</title>
+      <style>body{font-family:system-ui;background:#0f1115;color:#e7eaf0;padding:40px}</style>
+      </head>
+      <body>
+        <h1>🚀 Celebeaty API läuft</h1>
+        <p>Login: <a style="color:#1DB954" href="/login">/login</a></p>
+        <p>Force-Login: <a style="color:#1DB954" href="/force-login">/force-login</a></p>
+        <p>Health: <code>/health</code></p>
+      </body>
+    </html>
+  `);
+});
+
+// ---------- WS-Server ----------
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocket.Server({ server });
 
-// Directory & Rooms
-const rooms = new Map();      // roomId -> Set(ws)
-const directory = new Map();  // roomId -> { roomId, host:{id,name,avatar}, since:number }
-
-function ensureRoom(roomId) {
-  if (!rooms.has(roomId)) rooms.set(roomId, new Set());
-  return rooms.get(roomId);
-}
-function broadcastToAll(data) {
-  const payload = JSON.stringify(data);
-  let n = 0;
-  wss.clients.forEach((c) => {
-    if (c.readyState === 1) { c.send(payload); n++; }
-  });
-  console.log(`WS broadcastAll type=${data?.type} to ${n} client(s)`);
-}
-function broadcastRoom(roomId, data, except) {
-  const payload = JSON.stringify(data);
-  const set = rooms.get(roomId);
-  if (!set) return;
-  let n = 0;
-  for (const c of set) {
-    if (c.readyState === 1 && c !== except) { c.send(payload); n++; }
-  }
-  console.log(`WS broadcastRoom room=${roomId} type=${data?.type} to ${n} client(s)`);
-}
-function sendDirectorySnapshot(ws) {
-  const lives = Array.from(directory.values());
-  ws.send(JSON.stringify({ type: "directory", lives }));
-  console.log(`WS sent directory snapshot (${lives.length} live)`);
-}
-
-// Heartbeat (Ping/Pong)
-function heartbeat() { this.isAlive = true; }
+// Simple Broadcast-Hub: Presence + Track-Events
 wss.on("connection", (ws) => {
-  ws.isAlive = true;
-  ws.on("pong", heartbeat);
-
-  ws.meta = { roomId: null, user: null };
-  sendDirectorySnapshot(ws);
-
   ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    if (msg.type === "identify" && msg.user) {
-      ws.meta.user = msg.user;
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
       return;
     }
-
-    if (msg.type === "join" && msg.roomId) {
-      const prev = ws.meta.roomId;
-      if (prev && rooms.has(prev)) rooms.get(prev).delete(ws);
-      ws.meta.roomId = msg.roomId;
-      ensureRoom(msg.roomId).add(ws);
-      console.log(`WS join room=${msg.roomId}`);
-      return;
-    }
-
-    if (msg.type === "go_live" && msg.roomId && msg.host) {
-      ws.meta.roomId = msg.roomId;
-      ensureRoom(msg.roomId).add(ws);
-      directory.set(msg.roomId, { roomId: msg.roomId, host: msg.host, since: Date.now() });
-      broadcastToAll({ type: "directory", lives: Array.from(directory.values()) });
-      console.log(`WS go_live room=${msg.roomId} host=${msg.host?.name || "?"}`);
-      return;
-    }
-
-    if (msg.type === "go_offline" && msg.roomId) {
-      directory.delete(msg.roomId);
-      broadcastToAll({ type: "directory", lives: Array.from(directory.values()) });
-      console.log(`WS go_offline room=${msg.roomId}`);
-      return;
-    }
-
-    // Relay: sync / track (legacy) / snapshot_request
-    if ((msg.type === "sync" || msg.type === "track" || msg.type === "snapshot_request") && ws.meta.roomId) {
-      broadcastRoom(ws.meta.roomId, msg, ws);
-      return;
-    }
-  });
-
-  ws.on("close", () => {
-    const r = ws.meta.roomId;
-    if (r && rooms.has(r)) rooms.get(r).delete(ws);
+    // An alle außer Sender weiterleiten
+    wss.clients.forEach((client) => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(data));
+      }
+    });
   });
 });
 
-const pingInterval = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping(() => {});
-  });
-}, 25000);
-wss.on("close", () => clearInterval(pingInterval));
-
-// Error-Handler
-app.use((err, _req, res, _next) => {
-  console.error("❌ Unhandled error:", err);
-  res.status(500).json({ error: "internal_error", details: String(err?.stack || err) });
-});
-
-// Start
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`✅ Backend läuft auf Port ${PORT}`);
+  console.log(`✅ Celebeaty API listening on :${PORT}`);
 });
