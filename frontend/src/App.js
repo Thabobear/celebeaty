@@ -2,67 +2,88 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 /**
- * Backend/WS aus ENV (CRA: REACT_APP_*)
- * In Vercel: REACT_APP_BACKEND_URL=https://celebeaty.onrender.com
- * Lokal:     REACT_APP_BACKEND_URL=http://localhost:3001  (oder ngrok)
+ * CRA: Backend-URL aus ENV
+ * Prod (Vercel): REACT_APP_BACKEND_URL=https://celebeaty.onrender.com
+ * Lokal:         REACT_APP_BACKEND_URL=http://localhost:3001  (oder ngrok)
  */
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:3001";
 const WS_URL = BACKEND_URL.replace(/^http/, "ws"); // https->wss, http->ws
 
-// --- Helfer ---
+// ---------- Helpers ----------
 function msToMMSS(ms = 0) {
   const s = Math.max(0, Math.floor(ms / 1000));
   const mm = String(Math.floor(s / 60)).padStart(2, "0");
   const ss = String(s % 60).padStart(2, "0");
   return `${mm}:${ss}`;
 }
-
-// Präsenz läuft über WebSocket rein (sehr simples Presence-Modell)
 function nowTs() {
   return Date.now();
 }
 
+// Deep link to follow sender
+function buildFollowLink(senderId) {
+  const base = window.location.origin;
+  return `${base}/?follow=${encodeURIComponent(senderId)}`;
+}
+
+// Lightweight QR image url (keine zusätzliche Lib)
+function qrUrl(text) {
+  const size = "220x220";
+  return `https://api.qrserver.com/v1/create-qr-code/?size=${size}&data=${encodeURIComponent(text)}`;
+}
+
 export default function App() {
-  // Auth + Nutzer
+  // Auth + User
   const [token, setToken] = useState(null);
   const [me, setMe] = useState(null); // {id, display_name}
 
-  // Modus: "idle" | "sender" | "receiver"
+  // Mode: "idle" | "sender" | "receiver"
   const [mode, setMode] = useState("idle");
 
-  // Sender-Zustand
+  // Sender state
   const [isSharing, setIsSharing] = useState(false);
-  const [senderNow, setSenderNow] = useState(null); // {id,name,artists[],progress_ms,image}
+  const [senderNow, setSenderNow] = useState(null);
 
-  // Receiver-Zustand
+  // Receiver state
   const [followingUserId, setFollowingUserId] = useState(null);
-  const [recvNow, setRecvNow] = useState(null); // letzter empfangener Track
+  const [recvNow, setRecvNow] = useState(null);
 
-  // Lobby / Live-Liste
+  // Lobby presence
   const [liveMap, setLiveMap] = useState(new Map()); // userId -> {id,name,since,lastSeen}
 
-  // Hints/Fehler
+  // UI state
   const [hint, setHint] = useState("");
+  const [showMenu, setShowMenu] = useState(false);
+  const [showInvite, setShowInvite] = useState(false);
+  const [showQR, setShowQR] = useState(false);
 
-  // WS & Interval Refs
+  // Refs
   const ws = useRef(null);
   const shareTimer = useRef(null);
 
-  // ===== 1) Token aus URL oder localStorage =====
+  // ===== 1) URL params (access_token, follow) / localStorage token =====
   useEffect(() => {
     const qs = new URLSearchParams(window.location.search);
     const t = qs.get("access_token");
+    const follow = qs.get("follow");
+
     if (t) {
       setToken(t);
       localStorage.setItem("spotify_token", t);
-      window.history.replaceState({}, document.title, "/");
+      // URL säubern, follow erhalten falls gesetzt
+      const cleanUrl = follow ? `/?follow=${encodeURIComponent(follow)}` : "/";
+      window.history.replaceState({}, document.title, cleanUrl);
     } else {
       const stored = localStorage.getItem("spotify_token");
       if (stored) setToken(stored);
     }
+
+    if (follow) {
+      setFollowingUserId(follow);
+    }
   }, []);
 
-  // ===== 2) Wer bin ich? =====
+  // ===== 2) whoami =====
   useEffect(() => {
     if (!token) return;
     (async () => {
@@ -72,26 +93,31 @@ export default function App() {
         });
         if (!r.ok) throw new Error(`whoami status ${r.status}`);
         const j = await r.json();
-        setMe({ id: j.id, display_name: j.display_name || "Unbekannt" });
+        const display = j.display_name || j.id || "Unbekannt";
+        setMe({ id: j.id, display_name: display });
       } catch (e) {
         console.warn("whoami error:", e);
+        setMe(null);
       }
     })();
   }, [token]);
 
-  // ===== 3) WebSocket verbinden =====
+  // ===== 3) WebSocket =====
   useEffect(() => {
     if (!token) return;
 
     ws.current = new WebSocket(WS_URL);
+
     ws.current.onopen = () => {
-      // leichte Präsenzmeldung beim Connect
       if (me?.id) {
         ws.current.send(JSON.stringify({ type: "hello", userId: me.id, name: me.display_name, ts: nowTs() }));
       }
+      // Auto-enter receiver bei deep link
+      if (me?.id && followingUserId && mode === "idle") {
+        setMode("receiver");
+        setHint("Beim nächsten Ereignis starten wir automatisch.");
+      }
     };
-    ws.current.onclose = () => {};
-    ws.current.onerror = (e) => console.warn("WS error", e);
 
     ws.current.onmessage = async (event) => {
       let data;
@@ -102,7 +128,7 @@ export default function App() {
       }
       if (!data?.type) return;
 
-      // Presence-Start/Stop aus Lobby verarbeiten
+      // Presence
       if (data.type === "presence" && data.action && data.user) {
         setLiveMap((prev) => {
           const copy = new Map(prev);
@@ -116,32 +142,31 @@ export default function App() {
           } else if (data.action === "stop") {
             copy.delete(data.user.id);
           } else if (data.action === "ping") {
-            const existing = copy.get(data.user.id);
-            if (existing) existing.lastSeen = data.ts || nowTs();
+            const ex = copy.get(data.user.id);
+            if (ex) ex.lastSeen = data.ts || nowTs();
           }
           return copy;
         });
         return;
       }
 
-      // Track-Events vom Sender → nur relevant, wenn ich Receiver bin und diesem User folge
+      // Track event
       if (data.type === "track") {
-        // Lobby „alive halten“
-        if (data.user && data.user.id) {
+        // keep sender alive in lobby
+        if (data.user?.id) {
           setLiveMap((prev) => {
             const copy = new Map(prev);
-            const existing = copy.get(data.user.id);
-            if (existing) existing.lastSeen = data.ts || nowTs();
+            const ex = copy.get(data.user.id);
+            if (ex) ex.lastSeen = data.ts || nowTs();
             return copy;
           });
         }
 
+        // nur anwenden, wenn Receiver und ich folge diesem Sender
         if (mode !== "receiver") return;
         if (followingUserId && data.user?.id !== followingUserId) return;
 
         const { trackId, progress_ms, name, artists, image } = data;
-
-        // UI sofort aktualisieren
         setRecvNow({
           id: trackId,
           name: name || trackId,
@@ -149,18 +174,17 @@ export default function App() {
           progress_ms: progress_ms || 0,
           image: image || null,
         });
-
-        // Playback am Empfänger anstoßen (mit sanfter Gerätewahl)
         await ensurePlaybackAndPlay(token, trackId, progress_ms || 0, setHint);
       }
     };
 
-    return () => {
-      ws.current?.close();
-    };
-  }, [token, me?.id, mode, followingUserId]);
+    ws.current.onclose = () => {};
+    ws.current.onerror = (e) => console.warn("WS error", e);
 
-  // ===== 4) Sender: periodisch senden, wenn isSharing true =====
+    return () => ws.current?.close();
+  }, [token, me?.id, followingUserId, mode]);
+
+  // ===== 4) Sender ticker =====
   useEffect(() => {
     if (!token) return;
     if (mode !== "sender" || !isSharing) {
@@ -171,7 +195,7 @@ export default function App() {
       return;
     }
 
-    // Präsenz-Start
+    // Presence start
     if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
       ws.current.send(JSON.stringify({
         type: "presence",
@@ -181,7 +205,6 @@ export default function App() {
       }));
     }
 
-    // Ticker: alle 2000ms aktuellen Track holen & an alle schicken
     const tick = async () => {
       try {
         const r = await fetch(`${BACKEND_URL}/currently-playing`, {
@@ -191,8 +214,7 @@ export default function App() {
 
         if (!data?.is_playing || !data?.track?.id) {
           setSenderNow(null);
-          setHint(data?.message || "Kein Song läuft (oder kein aktives Gerät).");
-          // Präsenz-Ping ohne Track – hält Lobby am Leben
+          setHint(data?.message || "Kein Song läuft oder kein aktives Gerät.");
           if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
             ws.current.send(JSON.stringify({
               type: "presence",
@@ -240,99 +262,145 @@ export default function App() {
     };
   }, [mode, isSharing, token, me?.id]);
 
-  // ===== 5) Lobby-Ansicht berechnet (Array aus Map) =====
+  // ===== 5) LiveList =====
   const liveList = useMemo(() => {
     const arr = Array.from(liveMap.values());
-    // inaktive Einträge (kein Ping > 15s) rausfiltern
     const cutoff = Date.now() - 15000;
     return arr
       .filter((x) => (x.lastSeen || x.since || 0) > cutoff)
       .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
   }, [liveMap]);
 
-  // ===== 6) UI =====
+  // ===== UI =====
   if (!token) {
     return (
       <div className="layout">
         <Header />
         <main className="main">
-          <Card>
+          <div className="hero">
+            <LogoWord />
+            <p className="heroSub">Der exklusive Club, um live mit deinen Idolen mitzuhören.</p>
+          </div>
+          <div className="ctaCard card">
             <h2>Login mit Spotify</h2>
-            <p>Verbinde dich, um zu sehen, wer gerade teilt – oder starte selbst.</p>
+            <p>Sieh, wer gerade teilt – oder starte deine eigene Live‑Session.</p>
             <div className="row">
-              <a className="btn primary" href={`${BACKEND_URL}/login`}>➡️ Login</a>
-              <a className="btn" href={`${BACKEND_URL}/force-login`}>👤 Mit anderem Account</a>
+              <a className="btn primary" href={`${BACKEND_URL}/login`}>Login</a>
+              <a className="btn" href={`${BACKEND_URL}/force-login`}>Mit anderem Account</a>
             </div>
-          </Card>
+          </div>
         </main>
         <Footer />
       </div>
     );
   }
 
+  const inviteLink = me?.id ? buildFollowLink(me.id) : "";
+
   return (
     <div className="layout">
-      <Header me={me} onLogout={() => {
-        setMode("idle");
-        setIsSharing(false);
-        setSenderNow(null);
-        setRecvNow(null);
-        setFollowingUserId(null);
-        setHint("");
-        setMe(null);
-        localStorage.removeItem("spotify_token");
-        window.location.href = "/";
-      }} />
+      <Header
+        me={me}
+        onLogout={() => {
+          setMode("idle");
+          setIsSharing(false);
+          setSenderNow(null);
+          setRecvNow(null);
+          setFollowingUserId(null);
+          setHint("");
+          setMe(null);
+          localStorage.removeItem("spotify_token");
+          window.location.href = "/";
+        }}
+        onOpenMenu={() => setShowMenu((v) => !v)}
+        menuOpen={showMenu}
+      />
+
       <main className="main">
+        {hint && <div className="hint">{hint}</div>}
 
-        {/* Hints */}
-        {hint && <div className="hint">💡 {hint}</div>}
-
-        {/* Wenn ich gerade sende */}
+        {/* Sender view */}
         {mode === "sender" && (
-          <Card>
-            <div className="liveBadge">LIVE</div>
-            <h2>Du teilst gerade Musik</h2>
-            {!senderNow && <p>Warte auf laufenden Song…</p>}
-            {senderNow && (
-              <NowPlayingBox
-                title="Gerade beim Sender"
-                track={senderNow}
-              />
-            )}
-            <div className="row">
-              <button
-                className="btn"
-                onClick={() => {
-                  setIsSharing(false);
-                  setMode("idle");
-                  if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
-                    ws.current.send(JSON.stringify({
-                      type: "presence",
-                      action: "stop",
-                      user: { id: me.id, name: me.display_name },
-                      ts: nowTs(),
-                    }));
-                  }
-                }}
-              >
-                ⏹️ Teilen stoppen
-              </button>
+          <div className="grid2">
+            <div className="card">
+              <div className="liveBadge">LIVE</div>
+              <h2>Du teilst gerade Musik</h2>
+              {!senderNow && <p>Warte auf laufenden Song…</p>}
+              {senderNow && <NowPlayingBox title="Gerade beim Sender" track={senderNow} />}
+              <div className="row">
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setIsSharing(false);
+                    setMode("idle");
+                    if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
+                      ws.current.send(JSON.stringify({
+                        type: "presence",
+                        action: "stop",
+                        user: { id: me.id, name: me.display_name },
+                        ts: nowTs(),
+                      }));
+                    }
+                  }}
+                >
+                  Teilen stoppen
+                </button>
+                <button className="btn" onClick={() => setShowInvite(true)}>
+                  Einladen
+                </button>
+              </div>
             </div>
-          </Card>
+
+            <div className="card">
+              <h3>Einladung</h3>
+              <p>Teile deinen persönlichen Link – Freunde joinen mit einem Klick.</p>
+              <div className="inviteRow">
+                <code className="inviteLink">{inviteLink}</code>
+                <button
+                  className="btn primary"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(inviteLink);
+                      setHint("Einladungslink kopiert.");
+                    } catch {
+                      setHint("Konnte Link nicht kopieren.");
+                    }
+                  }}
+                >
+                  Link kopieren
+                </button>
+              </div>
+              <div className="row">
+                <button className="btn" onClick={() => setShowQR(true)}>
+                  QR anzeigen
+                </button>
+                {"share" in navigator && (
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      navigator
+                        .share({
+                          title: "Celebeaty – hör mit",
+                          text: "Join my live session on Celebeaty",
+                          url: inviteLink,
+                        })
+                        .catch(() => {});
+                    }}
+                  >
+                    Systemteilen
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
         )}
 
-        {/* Wenn ich gerade zuhöre */}
+        {/* Receiver view */}
         {mode === "receiver" && (
-          <Card>
+          <div className="card">
             <h2>Du hörst mit</h2>
             {!recvNow && <p>Warte auf Song vom Sender…</p>}
-            {recvNow && (
-              <NowPlayingBox
-                title="Gerade beim Empfänger"
-                track={recvNow}
-              />
-            )}
+            {recvNow && <NowPlayingBox title="Gerade beim Empfänger" track={recvNow} />}
             <div className="row">
               <button
                 className="btn"
@@ -345,7 +413,7 @@ export default function App() {
                   }
                 }}
               >
-                ▶️ Erneut abspielen
+                Erneut abspielen
               </button>
               <button
                 className="btn"
@@ -355,13 +423,13 @@ export default function App() {
                   setFollowingUserId(null);
                 }}
               >
-                ✖️ Verlassen
+                Verlassen
               </button>
             </div>
-          </Card>
+          </div>
         )}
 
-        {/* Lobby – Standardansicht */}
+        {/* Lobby */}
         {mode === "idle" && (
           <>
             <section className="section">
@@ -371,9 +439,9 @@ export default function App() {
               </div>
 
               {liveList.length === 0 && (
-                <Card muted>
+                <div className="card muted">
                   <p>Niemand teilt gerade – starte selbst oder warte auf eine Einladung.</p>
-                </Card>
+                </div>
               )}
 
               <div className="grid">
@@ -393,10 +461,22 @@ export default function App() {
                         onClick={() => {
                           setFollowingUserId(u.id);
                           setMode("receiver");
-                          setHint("Beim nächsten Event starten wir automatisch.");
+                          setHint("Beim nächsten Ereignis starten wir automatisch.");
                         }}
                       >
-                        ▶️ Mitspielen
+                        Mitspielen
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={async () => {
+                          const link = buildFollowLink(u.id);
+                          try {
+                            await navigator.clipboard.writeText(link);
+                            setHint("Join-Link kopiert.");
+                          } catch {}
+                        }}
+                      >
+                        Link kopieren
                       </button>
                     </div>
                   </div>
@@ -405,7 +485,7 @@ export default function App() {
             </section>
 
             <section className="section">
-              <Card>
+              <div className="card">
                 <h2>Selbst teilen</h2>
                 <p>Starte deine Live‑Session. Deine Freunde können in „Gerade live“ beitreten.</p>
                 <div className="row">
@@ -414,8 +494,7 @@ export default function App() {
                     onClick={() => {
                       setMode("sender");
                       setIsSharing(true);
-                      setHint("Teilen aktiv. Öffne Spotify und spiel einen Song.");
-                      // Präsenz sofort melden
+                      setHint("Teilen aktiv. Öffne Spotify und spiele einen Song.");
                       if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
                         ws.current.send(JSON.stringify({
                           type: "presence",
@@ -426,25 +505,101 @@ export default function App() {
                       }
                     }}
                   >
-                    🎵 Live teilen starten
+                    Live teilen starten
                   </button>
                 </div>
-              </Card>
+              </div>
             </section>
           </>
         )}
       </main>
+
       <Footer />
+
+      {/* ---- Menü (Header) ---- */}
+      {showMenu && (
+        <Menu onClose={() => setShowMenu(false)}>
+          <button className="menuItem" onClick={() => { window.location.href = `${BACKEND_URL}/force-login`; }}>
+            Mit anderem Account
+          </button>
+          <button className="menuItem" onClick={() => { setShowMenu(false); alert("Support: hello@celebeaty.com"); }}>
+            Support
+          </button>
+          <button
+            className="menuItem danger"
+            onClick={() => {
+              setShowMenu(false);
+              // Hard logout
+              setMode("idle");
+              setIsSharing(false);
+              setSenderNow(null);
+              setRecvNow(null);
+              setFollowingUserId(null);
+              setHint("");
+              setMe(null);
+              localStorage.removeItem("spotify_token");
+              window.location.href = "/";
+            }}
+          >
+            Abmelden
+          </button>
+        </Menu>
+      )}
+
+      {/* ---- Invite Modal ---- */}
+      {showInvite && (
+        <Modal onClose={() => setShowInvite(false)} title="Freunde einladen">
+          <p>Teile diesen Link, damit Freunde direkt deiner Session folgen:</p>
+          <div className="inviteRow">
+            <code className="inviteLink">{inviteLink}</code>
+            <button
+              className="btn primary"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(inviteLink);
+                  setHint("Einladungslink kopiert.");
+                } catch {}
+              }}
+            >
+              Link kopieren
+            </button>
+          </div>
+          <div className="row">
+            <button className="btn" onClick={() => setShowQR(true)}>QR anzeigen</button>
+            {"share" in navigator && (
+              <button
+                className="btn"
+                onClick={() => {
+                  navigator.share({ title: "Celebeaty – hör mit", url: inviteLink }).catch(() => {});
+                }}
+              >
+                Systemteilen
+              </button>
+            )}
+          </div>
+        </Modal>
+      )}
+
+      {/* ---- QR Modal ---- */}
+      {showQR && (
+        <Modal onClose={() => setShowQR(false)} title="QR‑Code">
+          <div className="qrWrap">
+            <img className="qrImg" src={qrUrl(inviteLink)} alt="QR" />
+          </div>
+          <p className="qrHint">Freunde scannen – sie joinen direkt deiner Session.</p>
+        </Modal>
+      )}
     </div>
   );
 }
 
-// ====== UI Bausteine ======
-function Header({ me, onLogout }) {
+// ---------- UI Components ----------
+
+function Header({ me, onLogout, onOpenMenu, menuOpen }) {
   return (
     <header className="header">
       <div className="brand">
-        <div className="logoDot" />
+        <LogoMark />
         <span>Celebeaty</span>
       </div>
       <div className="spacer" />
@@ -452,7 +607,7 @@ function Header({ me, onLogout }) {
         <div className="user">
           <div className="avatar">{(me.display_name || "?").slice(0, 1)}</div>
           <span className="userName">{me.display_name}</span>
-          <button className="btn ghost" onClick={onLogout}>🚪 Abmelden</button>
+          <button className="btn ghost" onClick={onOpenMenu}>{menuOpen ? "Schließen" : "Optionen"}</button>
         </div>
       ) : (
         <a className="btn ghost" href={`${BACKEND_URL}/login`}>Login</a>
@@ -464,13 +619,9 @@ function Header({ me, onLogout }) {
 function Footer() {
   return (
     <footer className="footer">
-      <span>Made with 🎧</span>
+      <span>Celebeaty</span>
     </footer>
   );
-}
-
-function Card({ children, muted }) {
-  return <div className={`card ${muted ? "muted" : ""}`}>{children}</div>;
 }
 
 function NowPlayingBox({ title, track }) {
@@ -491,7 +642,147 @@ function NowPlayingBox({ title, track }) {
   );
 }
 
-// ====== Playback Helpers (Receiver) ======
+function Menu({ children, onClose }) {
+  useEffect(() => {
+    const onEsc = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [onClose]);
+
+  return (
+    <div className="menuOverlay" onClick={onClose}>
+      <div className="menuSheet" onClick={(e) => e.stopPropagation()}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Modal({ title, children, onClose }) {
+  useEffect(() => {
+    const onEsc = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [onClose]);
+
+  return (
+    <div className="modalOverlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modalHead">
+          <h3>{title}</h3>
+          <button className="btn ghost" onClick={onClose}>Schließen</button>
+        </div>
+        <div className="modalBody">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Logos (Ivory Luxe) ----------
+
+function LogoMark() {
+  return (
+    <svg
+      viewBox="0 0 140 140"
+      width="72"
+      height="72"
+      role="img"
+      aria-label="CB Logo"
+    >
+      <defs>
+        {/* Champagne-Gradient wie im UI */}
+        <linearGradient id="champ" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stopColor="#E9DCCB" />
+          <stop offset="100%" stopColor="#D9C4A1" />
+        </linearGradient>
+
+        {/* zarter Glanz */}
+        <radialGradient id="gloss" cx="30%" cy="20%" r="60%">
+          <stop offset="0%" stopColor="rgba(255,255,255,.65)" />
+          <stop offset="60%" stopColor="rgba(255,255,255,.15)" />
+          <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+        </radialGradient>
+
+        {/* sanfter Schatten */}
+        <filter id="softShadow" x="-50%" y="-50%" width="200%" height="200%">
+          <feDropShadow dx="0" dy="6" stdDeviation="6" floodOpacity="0.18" />
+        </filter>
+      </defs>
+
+      {/* Hintergrundkreis */}
+      <circle
+        cx="70"
+        cy="70"
+        r="64"
+        fill="url(#champ)"
+        stroke="#FFFFFF"
+        strokeOpacity=".4"
+        strokeWidth="2"
+        filter="url(#softShadow)"
+      />
+
+      {/* zarte Innenkante */}
+      <circle
+        cx="70"
+        cy="70"
+        r="50"
+        fill="none"
+        stroke="rgba(255,255,255,.35)"
+        strokeWidth="1.25"
+      />
+
+      {/* Glanz oben links */}
+      <circle cx="70" cy="70" r="64" fill="url(#gloss)" />
+
+      {/* Initialen CB */}
+      <text
+        x="50%"
+        y="50%"
+        dominantBaseline="middle"
+        textAnchor="middle"
+        fontFamily="'Roboto Condensed', Helvetica, Arial, sans-serif"
+        fontSize="54"
+        fontWeight="700"
+        letterSpacing="1.5"
+        fill="#2B2A27"
+      >
+        CB
+      </text>
+    </svg>
+  );
+}
+
+
+
+function LogoWord() {
+  return (
+    <div className="logoLarge">
+      <svg viewBox="0 0 480 100" width="360" height="88" aria-hidden>
+        <defs>
+          <linearGradient id="champ2" x1="0" y1="0" x2="1" y2="1">
+            {/* kräftiger, dunklerer Gold-Verlauf */}
+            <stop offset="0%" stopColor="#D2B48C"/>
+            <stop offset="100%" stopColor="#A67C52"/>
+          </linearGradient>
+        </defs>
+        <text
+          x="50%"
+          y="68"
+          textAnchor="middle"
+          fontFamily="Inter, ui-sans-serif"
+          fontSize="66"
+          fontWeight="900"
+          fill="url(#champ2)"
+        >
+          Celebeaty
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+
+// ---------- Playback Helpers (Receiver) ----------
 async function getDevices(token) {
   const r = await fetch("https://api.spotify.com/v1/me/player/devices", {
     headers: { Authorization: `Bearer ${token}` },
@@ -499,7 +790,6 @@ async function getDevices(token) {
   if (!r.ok) return { devices: [] };
   return r.json();
 }
-
 async function transferToDevice(token, deviceId, autoPlay = true) {
   const r = await fetch("https://api.spotify.com/v1/me/player", {
     method: "PUT",
@@ -511,7 +801,6 @@ async function transferToDevice(token, deviceId, autoPlay = true) {
     throw new Error(`Transfer-Fehler ${r.status}:\n${t.slice(0, 400)}`);
   }
 }
-
 async function ensurePlaybackAndPlay(token, trackId, positionMs, setHint) {
   try {
     const devJson = await getDevices(token);
@@ -520,7 +809,6 @@ async function ensurePlaybackAndPlay(token, trackId, positionMs, setHint) {
       setHint?.("Kein Spotify‑Gerät verfügbar. Öffne Spotify beim Empfänger.");
       return;
     }
-    // best device wählen
     let device = devices.find((d) => d.is_active) || devices.find((d) => !d.is_restricted) || devices[0];
 
     if (!device.is_active) {
@@ -536,7 +824,7 @@ async function ensurePlaybackAndPlay(token, trackId, positionMs, setHint) {
     if (!playRes.ok) {
       const t = await playRes.text();
       if (playRes.status === 403 || playRes.status === 404) {
-        setHint?.("Playback nicht möglich. Öffne Spotify & starte kurz manuell.");
+        setHint?.("Playback nicht möglich. Öffne Spotify und starte kurz manuell.");
       } else {
         setHint?.(`Playback-Fehler ${playRes.status}:\n${t.slice(0, 200)}`);
       }
@@ -548,15 +836,11 @@ async function ensurePlaybackAndPlay(token, trackId, positionMs, setHint) {
     console.warn(e);
   }
 }
-
 async function replayReceived(token, recvNow) {
   const r = await fetch("https://api.spotify.com/v1/me/player/play", {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      uris: [`spotify:track:${recvNow.id}`],
-      position_ms: recvNow.progress_ms || 0,
-    }),
+    body: JSON.stringify({ uris: [`spotify:track:${recvNow.id}`], position_ms: recvNow.progress_ms || 0 }),
   });
   if (!r.ok) {
     const t = await r.text();
