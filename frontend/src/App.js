@@ -13,10 +13,11 @@ const BACKEND_URL =
 
 
 // WebSocket-URL aus Backend/Origin bauen
-const WS_URL = (BACKEND_URL || window.location.origin).replace(
+const WS_BASE = (BACKEND_URL || window.location.origin).replace(
   /^http(s?):/,
   (m, s) => (s ? "wss:" : "ws:")
 );
+const WS_URL = WS_BASE.replace(/\/+$/, "") + "/ws";
 
 // ---------- Helpers ----------
 function msToMMSS(ms = 0) {

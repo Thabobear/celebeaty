@@ -483,8 +483,42 @@ if (clientBuildPath) {
 }
 
 /* -------------------- WebSocket ------------------------ */
+// neu: WS unter /ws terminieren (stabiler hinter Proxies)
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ noServer: true });
+
+// optional: Origin-Check für Sicherheit (gleiche Domain erlauben)
+function isWsOriginAllowed(origin) {
+  // erlaube deine Vercel-Domain + Backend-Domain
+  const ok = ["https://celebeaty.vercel.app", "https://celebeaty.onrender.com"];
+  return !origin || ok.includes(origin);
+}
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const { url = "", headers = {} } = req;
+    const origin = headers.origin;
+
+    // nur /ws upgraden
+    if (!url.startsWith("/ws")) {
+      socket.destroy();
+      return;
+    }
+
+    // Origin prüfen (optional)
+    if (!isWsOriginAllowed(origin)) {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } catch {
+    socket.destroy();
+  }
+});
+
 
 wss.on("connection", (ws) => {
   ws.on("message", (raw) => {
