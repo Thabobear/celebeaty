@@ -223,3 +223,5 @@ body{
   .btn, .roomCard{ transition:none }
   .dot.live{ animation:none; box-shadow:none }
 }
+
+.logoMark { font-family: "Roboto Condensed", sans-serif; font-weight: 700; }

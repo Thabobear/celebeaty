@@ -2,12 +2,18 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 /**
- * CRA: Backend-URL aus ENV
- * Prod (Vercel): REACT_APP_BACKEND_URL=https://celebeaty.onrender.com
- * Lokal:         REACT_APP_BACKEND_URL=http://localhost:3001  (oder ngrok)
+ * BACKEND ableiten:
+ * - Single-Origin (bgrok/Prod): BACKEND_URL leer lassen → gleiche Origin
+ * - Lokal getrennt: per REACT_APP_BACKEND_URL setzen
  */
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:3001";
-const WS_URL = BACKEND_URL.replace(/^http/, "ws"); // https->wss, http->ws
+const BACKEND_URL =
+  (typeof process !== "undefined" && process.env && process.env.REACT_APP_BACKEND_URL) || "";
+
+// WebSocket-URL aus Backend/Origin bauen
+const WS_URL = (BACKEND_URL || window.location.origin).replace(
+  /^http(s?):/,
+  (m, s) => (s ? "wss:" : "ws:")
+);
 
 // ---------- Helpers ----------
 function msToMMSS(ms = 0) {
@@ -19,22 +25,93 @@ function msToMMSS(ms = 0) {
 function nowTs() {
   return Date.now();
 }
-
-// Deep link to follow sender
+const baseOrigin = window.location.origin;
 function buildFollowLink(senderId) {
-  const base = window.location.origin;
-  return `${base}/?follow=${encodeURIComponent(senderId)}`;
+  return `${baseOrigin}/?follow=${encodeURIComponent(senderId)}`;
 }
 
-// Lightweight QR image url (keine zusätzliche Lib)
-function qrUrl(text) {
-  const size = "220x220";
-  return `https://api.qrserver.com/v1/create-qr-code/?size=${size}&data=${encodeURIComponent(text)}`;
+// Snapshot des Senders bauen (für sofortigen Einstieg)
+function buildSenderSnapshot(me, senderNow) {
+  if (!senderNow) return null;
+  return {
+    type: senderNow.is_playing ? "track" : "pause",
+    user: { id: me.id, name: me.display_name },
+    trackId: senderNow.id || senderNow.trackId,
+    progress_ms: senderNow.progress_ms || 0,
+    name: senderNow.name,
+    artists: senderNow.artists || [],
+    image: senderNow.image || null,
+    is_playing: !!senderNow.is_playing,
+    ts: nowTs(),
+  };
+}
+
+// ---------- Playback via Backend-Proxys ----------
+async function getDevices() {
+  const r = await fetch(`${BACKEND_URL}/spotify/devices`, { credentials: "include" });
+  if (!r.ok) return { devices: [] };
+  return r.json();
+}
+async function transferToDevice(deviceId, autoPlay = true) {
+  const r = await fetch(`${BACKEND_URL}/spotify/transfer`, {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_ids: [deviceId], play: autoPlay }),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Transfer-Fehler ${r.status}:\n${t.slice(0, 400)}`);
+  }
+}
+async function backendPlay({ uris, position_ms }) {
+  const r = await fetch(`${BACKEND_URL}/spotify/play`, {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uris, position_ms }),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Play-Fehler ${r.status}:\n${t.slice(0, 400)}`);
+  }
+}
+async function backendPause() {
+  try {
+    await fetch(`${BACKEND_URL}/spotify/pause`, { method: "PUT", credentials: "include" });
+  } catch {}
+}
+
+async function ensurePlaybackAndPlay(trackId, leaderPositionMs, leaderSentAt, setHint) {
+  try {
+    const devJson = await getDevices();
+    const devices = devJson.devices || [];
+    if (!devices.length) {
+      setHint?.("Kein Spotify‑Gerät verfügbar. Öffne Spotify beim Empfänger.");
+      return;
+    }
+    let device =
+      devices.find((d) => d.is_active) || devices.find((d) => !d.is_restricted) || devices[0];
+    if (!device?.id) {
+      setHint?.("Kein geeignetes Gerät. Öffne Spotify einmal aktiv.");
+      return;
+    }
+    if (!device.is_active) {
+      await transferToDevice(device.id, true);
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    const now = Date.now();
+    const desired = Math.max(0, (leaderPositionMs || 0) + (now - (leaderSentAt || now)));
+    await backendPlay({ uris: [`spotify:track:${trackId}`], position_ms: desired });
+    setHint?.("");
+  } catch (e) {
+    setHint?.("Fehler beim Starten der Wiedergabe. Öffne Spotify beim Empfänger.");
+    console.warn(e);
+  }
 }
 
 export default function App() {
   // Auth + User
-  const [token, setToken] = useState(null);
   const [me, setMe] = useState(null); // {id, display_name}
 
   // Mode: "idle" | "sender" | "receiver"
@@ -42,54 +119,57 @@ export default function App() {
 
   // Sender state
   const [isSharing, setIsSharing] = useState(false);
-  const [senderNow, setSenderNow] = useState(null);
+  const [senderNow, setSenderNow] = useState(null); // {id,name,artists[],image,progress_ms,is_playing}
 
   // Receiver state
   const [followingUserId, setFollowingUserId] = useState(null);
-  const [recvNow, setRecvNow] = useState(null);
+  const prevFollowingRef = useRef(null);
+  const [recvNow, setRecvNow] = useState(null); // {id,...,_leaderTs,is_playing}
 
-  // Lobby presence
-  const [liveMap, setLiveMap] = useState(new Map()); // userId -> {id,name,since,lastSeen}
+  // Lobby presence (+ lastTrack)
+  const [liveMap, setLiveMap] = useState(new Map());
+  // Followers: targetUserId -> Map<followerId, {id,name,ts}>
+  const [followers, setFollowers] = useState(new Map());
 
   // UI state
   const [hint, setHint] = useState("");
   const [showMenu, setShowMenu] = useState(false);
-  const [showInvite, setShowInvite] = useState(false);
-  const [showQR, setShowQR] = useState(false);
 
   // Refs
   const ws = useRef(null);
   const shareTimer = useRef(null);
 
-  // ===== 1) URL params (access_token, follow) / localStorage token =====
+  // —— Anti-Ruckel + Initial‑Snapshot ——
+  const lastBroadcastRef = useRef({
+    trackId: null,
+    is_playing: null,
+    progress_ms: 0,
+    sentAt: 0,
+  });
+  const lastPresencePingRef = useRef(0);
+  const hasSentInitialRef = useRef(false);
+
+  // Name des aktuellen Senders (für Receiver-Texte)
+  const senderDisplay = useMemo(() => {
+    if (!followingUserId) return "dem Sender";
+    const u = liveMap.get(followingUserId);
+    return u?.name || "dem Sender";
+  }, [followingUserId, liveMap]);
+
+  // ===== 1) URL params (follow) =====
   useEffect(() => {
     const qs = new URLSearchParams(window.location.search);
-    const t = qs.get("access_token");
     const follow = qs.get("follow");
-
-    if (t) {
-      setToken(t);
-      localStorage.setItem("spotify_token", t);
-      // URL säubern, follow erhalten falls gesetzt
-      const cleanUrl = follow ? `/?follow=${encodeURIComponent(follow)}` : "/";
-      window.history.replaceState({}, document.title, cleanUrl);
-    } else {
-      const stored = localStorage.getItem("spotify_token");
-      if (stored) setToken(stored);
-    }
-
-    if (follow) {
-      setFollowingUserId(follow);
-    }
+    if (follow) setFollowingUserId(follow);
   }, []);
 
-  // ===== 2) whoami =====
+  // ===== 2) whoami (Cookies) =====
   useEffect(() => {
-    if (!token) return;
     (async () => {
       try {
         const r = await fetch(`${BACKEND_URL}/whoami`, {
-          headers: { Authorization: `Bearer ${token}`, "ngrok-skip-browser-warning": "true" },
+          credentials: "include",
+          headers: { "ngrok-skip-browser-warning": "true" },
         });
         if (!r.ok) throw new Error(`whoami status ${r.status}`);
         const j = await r.json();
@@ -100,22 +180,37 @@ export default function App() {
         setMe(null);
       }
     })();
-  }, [token]);
+  }, []);
 
   // ===== 3) WebSocket =====
   useEffect(() => {
-    if (!token) return;
-
     ws.current = new WebSocket(WS_URL);
 
     ws.current.onopen = () => {
       if (me?.id) {
-        ws.current.send(JSON.stringify({ type: "hello", userId: me.id, name: me.display_name, ts: nowTs() }));
+        ws.current.send(
+          JSON.stringify({ type: "hello", userId: me.id, name: me.display_name, ts: nowTs() })
+        );
       }
-      // Auto-enter receiver bei deep link
       if (me?.id && followingUserId && mode === "idle") {
         setMode("receiver");
-        setHint("Beim nächsten Ereignis starten wir automatisch.");
+        setHint(""); // keine alte Meldung
+        ws.current.send(
+          JSON.stringify({
+            type: "follow",
+            targetUserId: followingUserId,
+            user: { id: me.id, name: me.display_name },
+            ts: nowTs(),
+          })
+        );
+        ws.current.send(
+          JSON.stringify({
+            type: "req_snapshot",
+            targetUserId: followingUserId,
+            user: { id: me.id, name: me.display_name },
+            ts: nowTs(),
+          })
+        );
       }
     };
 
@@ -132,17 +227,24 @@ export default function App() {
       if (data.type === "presence" && data.action && data.user) {
         setLiveMap((prev) => {
           const copy = new Map(prev);
+          const uid = data.user.id;
           if (data.action === "start") {
-            copy.set(data.user.id, {
-              id: data.user.id,
+            copy.set(uid, {
+              id: uid,
               name: data.user.name,
               since: data.ts || nowTs(),
               lastSeen: data.ts || nowTs(),
+              lastTrack: copy.get(uid)?.lastTrack,
             });
           } else if (data.action === "stop") {
-            copy.delete(data.user.id);
+            copy.delete(uid);
+            setFollowers((prevF) => {
+              const fcopy = new Map(prevF);
+              fcopy.delete(uid);
+              return fcopy;
+            });
           } else if (data.action === "ping") {
-            const ex = copy.get(data.user.id);
+            const ex = copy.get(uid);
             if (ex) ex.lastSeen = data.ts || nowTs();
           }
           return copy;
@@ -150,31 +252,122 @@ export default function App() {
         return;
       }
 
-      // Track event
-      if (data.type === "track") {
-        // keep sender alive in lobby
-        if (data.user?.id) {
+      // Snapshot anfordern → Sender antwortet sofort
+      if (data.type === "req_snapshot") {
+        if (mode === "sender" && me?.id && data.targetUserId === me.id && senderNow) {
+          const snap = buildSenderSnapshot(me, senderNow);
+          if (snap && ws.current?.readyState === WebSocket.OPEN) {
+            ws.current.send(JSON.stringify(snap));
+            lastBroadcastRef.current = {
+              trackId: snap.trackId,
+              is_playing: snap.is_playing,
+              progress_ms: snap.progress_ms,
+              sentAt: Date.now(),
+            };
+          }
+        }
+        return;
+      }
+
+      // Track / Pause-Events
+      if (data.type === "track" || data.type === "pause") {
+        const { user, trackId, progress_ms, name, artists, image, ts, is_playing } = data;
+
+        // Lobby-Preview aktualisieren
+        if (user?.id) {
           setLiveMap((prev) => {
             const copy = new Map(prev);
-            const ex = copy.get(data.user.id);
-            if (ex) ex.lastSeen = data.ts || nowTs();
+            const ex = copy.get(user.id) || {
+              id: user.id,
+              name: user.name,
+              since: ts || nowTs(),
+              lastSeen: ts || nowTs(),
+            };
+            ex.lastSeen = ts || nowTs();
+            ex.lastTrack = {
+              trackId,
+              name: name || trackId,
+              artists: artists || [],
+              image: image || null,
+              atTs: ts || nowTs(),
+              progress_ms: progress_ms || 0,
+              is_playing: !!is_playing,
+            };
+            copy.set(user.id, ex);
             return copy;
           });
         }
 
-        // nur anwenden, wenn Receiver und ich folge diesem Sender
-        if (mode !== "receiver") return;
-        if (followingUserId && data.user?.id !== followingUserId) return;
+        // Receiver synchronisieren – nur wenn ich diesem Sender folge
+        if (mode === "receiver" && followingUserId && user?.id === followingUserId) {
+          if (data.type === "pause" || is_playing === false) {
+            await backendPause().catch(() => {});
+            setRecvNow((prev) => ({
+              ...(prev || {}),
+              id: trackId,
+              name: name || trackId,
+              artists: artists || [],
+              image: image || null,
+              progress_ms: progress_ms || 0,
+              _leaderTs: ts || nowTs(),
+              is_playing: false,
+            }));
+          } else {
+            setRecvNow({
+              id: trackId,
+              name: name || trackId,
+              artists: artists || [],
+              progress_ms: progress_ms || 0,
+              image: image || null,
+              _leaderTs: ts || nowTs(),
+              is_playing: true,
+            });
+            await ensurePlaybackAndPlay(trackId, progress_ms || 0, ts, setHint);
+          }
+        }
+        return;
+      }
 
-        const { trackId, progress_ms, name, artists, image } = data;
-        setRecvNow({
-          id: trackId,
-          name: name || trackId,
-          artists: artists || [],
-          progress_ms: progress_ms || 0,
-          image: image || null,
+      // Follow/Unfollow – Zuhörer zählen
+      if (data.type === "follow" && data.targetUserId && data.user?.id) {
+        setFollowers((prev) => {
+          const copy = new Map(prev);
+          const inner = new Map(copy.get(data.targetUserId) || new Map());
+          inner.set(data.user.id, {
+            id: data.user.id,
+            name: data.user.name || data.user.id,
+            ts: data.ts || nowTs(),
+          });
+          copy.set(data.targetUserId, inner);
+          return copy;
         });
-        await ensurePlaybackAndPlay(token, trackId, progress_ms || 0, setHint);
+
+        // Wenn ich der Sender bin und jemand mir folgt → sofort Snapshot senden
+        if (mode === "sender" && me?.id && data.targetUserId === me.id && senderNow) {
+          const snapshot = buildSenderSnapshot(me, senderNow);
+          try {
+            ws.current?.readyState === WebSocket.OPEN &&
+              ws.current.send(JSON.stringify(snapshot));
+            lastBroadcastRef.current = {
+              trackId: snapshot.trackId,
+              is_playing: snapshot.is_playing,
+              progress_ms: snapshot.progress_ms,
+              sentAt: Date.now(),
+            };
+          } catch {}
+        }
+        return;
+      }
+
+      if (data.type === "unfollow" && data.targetUserId && data.user?.id) {
+        setFollowers((prev) => {
+          const copy = new Map(prev);
+          const inner = new Map(copy.get(data.targetUserId) || new Map());
+          inner.delete(data.user.id);
+          copy.set(data.targetUserId, inner);
+          return copy;
+        });
+        return;
       }
     };
 
@@ -182,71 +375,187 @@ export default function App() {
     ws.current.onerror = (e) => console.warn("WS error", e);
 
     return () => ws.current?.close();
-  }, [token, me?.id, followingUserId, mode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me?.id, followingUserId, mode, senderNow?.id, senderNow?.is_playing, senderNow?.progress_ms]);
 
-  // ===== 4) Sender ticker =====
+  // ===== 4) Receiver Follow/Unfollow automatisch melden =====
   useEffect(() => {
-    if (!token) return;
+    const prev = prevFollowingRef.current;
+    if (prev && prev !== followingUserId && me?.id && ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(
+        JSON.stringify({
+          type: "unfollow",
+          targetUserId: prev,
+          user: { id: me.id, name: me.display_name },
+          ts: nowTs(),
+        })
+      );
+    }
+    if (followingUserId && me?.id && ws.current?.readyState === WebSocket.OPEN && mode === "receiver") {
+      ws.current.send(
+        JSON.stringify({
+          type: "follow",
+          targetUserId: followingUserId,
+          user: { id: me.id, name: me.display_name },
+          ts: nowTs(),
+        })
+      );
+      // gezielt Snapshot anfordern
+      ws.current.send(
+        JSON.stringify({
+          type: "req_snapshot",
+          targetUserId: followingUserId,
+          user: { id: me.id, name: me.display_name },
+          ts: nowTs(),
+        })
+      );
+    }
+    prevFollowingRef.current = followingUserId;
+  }, [followingUserId, mode, me?.id]);
+
+  // ===== 5) Sender ticker — nur Events broadcasten (+ Initial‑Snapshot) =====
+  useEffect(() => {
     if (mode !== "sender" || !isSharing) {
       if (shareTimer.current) {
         clearInterval(shareTimer.current);
         shareTimer.current = null;
       }
+      hasSentInitialRef.current = false;
       return;
     }
 
     // Presence start
     if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
-      ws.current.send(JSON.stringify({
-        type: "presence",
-        action: "start",
-        user: { id: me.id, name: me.display_name },
-        ts: nowTs(),
-      }));
+      ws.current.send(
+        JSON.stringify({
+          type: "presence",
+          action: "start",
+          user: { id: me.id, name: me.display_name },
+          ts: nowTs(),
+        })
+      );
     }
+    lastPresencePingRef.current = Date.now();
+    hasSentInitialRef.current = false;
+
+    const DRIFT_MS = 2000;  // ab ~2s = Seek
+    const POLL_MS  = 2000;  // Spotify Poll
+    const PING_MS  = 12000; // Präsenz-Ping
 
     const tick = async () => {
       try {
         const r = await fetch(`${BACKEND_URL}/currently-playing`, {
-          headers: { Authorization: `Bearer ${token}`, "ngrok-skip-browser-warning": "true" },
+          credentials: "include",
+          headers: { "ngrok-skip-browser-warning": "true" },
         });
         const data = await r.json();
 
-        if (!data?.is_playing || !data?.track?.id) {
+        // Heartbeat (Lobby sichtbar halten)
+        const now = Date.now();
+        if (ws.current?.readyState === WebSocket.OPEN && now - lastPresencePingRef.current > PING_MS && me?.id) {
+          ws.current.send(JSON.stringify({
+            type: "presence",
+            action: "ping",
+            user: { id: me.id, name: me.display_name },
+            ts: nowTs(),
+          }));
+          lastPresencePingRef.current = now;
+        }
+
+        // Kein Item: Werbung / keine Quelle / private Session
+        if (!data?.track?.id) {
           setSenderNow(null);
-          setHint(data?.message || "Kein Song läuft oder kein aktives Gerät.");
-          if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
-            ws.current.send(JSON.stringify({
-              type: "presence",
-              action: "ping",
-              user: { id: me.id, name: me.display_name },
-              ts: nowTs(),
-            }));
-          }
+          setHint(data?.message || "Kein Song/kein Gerät.");
           return;
         }
 
         const image = data.track?.album?.images?.[0]?.url || null;
-        setHint("");
-        setSenderNow({
-          id: data.track.id,
+        const curr = {
+          trackId: data.track.id,
+          is_playing: !!data.is_playing,
+          progress_ms: data.progress_ms || 0,
           name: data.track.name,
           artists: data.track.artists || [],
-          progress_ms: data.progress_ms || 0,
           image,
-        });
+        };
 
-        if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
-          ws.current.send(JSON.stringify({
-            type: "track",
+        // UI lokal
+        setSenderNow({
+          id: curr.trackId,
+          name: curr.name,
+          artists: curr.artists,
+          image: curr.image,
+          progress_ms: curr.progress_ms,
+          is_playing: curr.is_playing,
+        });
+        setHint(curr.is_playing ? "" : "Pausiert.");
+
+        // Initialer Snapshot sofort senden
+        if (!hasSentInitialRef.current && ws.current?.readyState === WebSocket.OPEN && me?.id) {
+          const initialMsg = {
+            type: curr.is_playing ? "track" : "pause",
             user: { id: me.id, name: me.display_name },
-            trackId: data.track.id,
-            progress_ms: data.progress_ms || 0,
-            name: data.track.name,
-            artists: data.track.artists || [],
-            image,
+            trackId: curr.trackId,
+            progress_ms: curr.progress_ms,
+            name: curr.name,
+            artists: curr.artists,
+            image: curr.image,
+            is_playing: curr.is_playing,
             ts: nowTs(),
-          }));
+          };
+          ws.current.send(JSON.stringify(initialMsg));
+          lastBroadcastRef.current = {
+            trackId: curr.trackId,
+            is_playing: curr.is_playing,
+            progress_ms: curr.progress_ms,
+            sentAt: Date.now(),
+          };
+          hasSentInitialRef.current = true;
+          return;
+        }
+
+        // Danach: Nur bei Events broadcasten
+        const prev = lastBroadcastRef.current;
+        let shouldBroadcast = false;
+        let eventType = "track"; // oder "pause"
+
+        if (prev.trackId !== curr.trackId) {
+          shouldBroadcast = true; // Trackwechsel
+          eventType = curr.is_playing ? "track" : "pause";
+        } else if (prev.is_playing !== curr.is_playing) {
+          shouldBroadcast = true; // Play/Pause-Wechsel
+          eventType = curr.is_playing ? "track" : "pause";
+        } else {
+          // Seek-Detektion über Drift
+          const expected = prev.is_playing
+            ? prev.progress_ms + (now - (prev.sentAt || now))
+            : prev.progress_ms;
+          const drift = Math.abs(curr.progress_ms - expected);
+          if (drift > DRIFT_MS) {
+            shouldBroadcast = true; // Seek
+            eventType = curr.is_playing ? "track" : "pause";
+          }
+        }
+
+        if (shouldBroadcast && ws.current?.readyState === WebSocket.OPEN && me?.id) {
+          const msg = {
+            type: eventType,
+            user: { id: me.id, name: me.display_name },
+            trackId: curr.trackId,
+            progress_ms: curr.progress_ms,
+            name: curr.name,
+            artists: curr.artists,
+            image: curr.image,
+            is_playing: curr.is_playing,
+            ts: nowTs(),
+          };
+          ws.current.send(JSON.stringify(msg));
+          lastBroadcastRef.current = {
+            trackId: curr.trackId,
+            is_playing: curr.is_playing,
+            progress_ms: curr.progress_ms,
+            sentAt: Date.now(),
+          };
         }
       } catch (e) {
         console.warn("currently-playing fetch error:", e);
@@ -255,14 +564,15 @@ export default function App() {
     };
 
     tick();
-    shareTimer.current = setInterval(tick, 2000);
+    shareTimer.current = setInterval(tick, POLL_MS);
     return () => {
       clearInterval(shareTimer.current);
       shareTimer.current = null;
     };
-  }, [mode, isSharing, token, me?.id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, isSharing, me?.id]);
 
-  // ===== 5) LiveList =====
+  // ===== 6) LiveList (inkl. Track-Preview) =====
   const liveList = useMemo(() => {
     const arr = Array.from(liveMap.values());
     const cutoff = Date.now() - 15000;
@@ -272,10 +582,10 @@ export default function App() {
   }, [liveMap]);
 
   // ===== UI =====
-  if (!token) {
+  if (!me) {
     return (
       <div className="layout">
-        <Header />
+        <Header me={null} onOpenMenu={() => {}} menuOpen={false} />
         <main className="main">
           <div className="hero">
             <LogoWord />
@@ -286,7 +596,6 @@ export default function App() {
             <p>Sieh, wer gerade teilt – oder starte deine eigene Live‑Session.</p>
             <div className="row">
               <a className="btn primary" href={`${BACKEND_URL}/login`}>Login</a>
-              <a className="btn" href={`${BACKEND_URL}/force-login`}>Mit anderem Account</a>
             </div>
           </div>
         </main>
@@ -295,26 +604,13 @@ export default function App() {
     );
   }
 
-  const inviteLink = me?.id ? buildFollowLink(me.id) : "";
+  const myFollowersMap = followers.get(me?.id) || new Map();
+  const myFollowersArr = Array.from(myFollowersMap.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  const myFollowersCount = myFollowersArr.length;
 
   return (
     <div className="layout">
-      <Header
-        me={me}
-        onLogout={() => {
-          setMode("idle");
-          setIsSharing(false);
-          setSenderNow(null);
-          setRecvNow(null);
-          setFollowingUserId(null);
-          setHint("");
-          setMe(null);
-          localStorage.removeItem("spotify_token");
-          window.location.href = "/";
-        }}
-        onOpenMenu={() => setShowMenu((v) => !v)}
-        menuOpen={showMenu}
-      />
+      <Header me={me} onOpenMenu={() => setShowMenu((v) => !v)} menuOpen={showMenu} />
 
       <main className="main">
         {hint && <div className="hint">{hint}</div>}
@@ -326,8 +622,22 @@ export default function App() {
               <div className="liveBadge">LIVE</div>
               <h2>Du teilst gerade Musik</h2>
               {!senderNow && <p>Warte auf laufenden Song…</p>}
-              {senderNow && <NowPlayingBox title="Gerade beim Sender" track={senderNow} />}
-              <div className="row">
+              {senderNow && (
+                <>
+                  <NowPlayingBox
+                    title={senderNow.is_playing ? "Gerade beim Sender" : "Pausiert beim Sender"}
+                    track={senderNow}
+                    live={false}
+                    leaderTs={null}
+                  />
+                  {!senderNow.is_playing && (
+                    <div style={{ color: "var(--sub)", marginTop: 8 }}>
+                      Du hast pausiert – Hörer bleiben verbunden.
+                    </div>
+                  )}
+                </>
+              )}
+              <div className="row" style={{ marginTop: 8 }}>
                 <button
                   className="btn"
                   onClick={() => {
@@ -341,56 +651,39 @@ export default function App() {
                         ts: nowTs(),
                       }));
                     }
+                    hasSentInitialRef.current = false;
                   }}
                 >
                   Teilen stoppen
                 </button>
-                <button className="btn" onClick={() => setShowInvite(true)}>
-                  Einladen
-                </button>
               </div>
             </div>
 
+            {/* Zuhörer-Card */}
             <div className="card">
-              <h3>Einladung</h3>
-              <p>Teile deinen persönlichen Link – Freunde joinen mit einem Klick.</p>
-              <div className="inviteRow">
-                <code className="inviteLink">{inviteLink}</code>
-                <button
-                  className="btn primary"
-                  onClick={async () => {
-                    try {
-                      await navigator.clipboard.writeText(inviteLink);
-                      setHint("Einladungslink kopiert.");
-                    } catch {
-                      setHint("Konnte Link nicht kopieren.");
-                    }
-                  }}
-                >
-                  Link kopieren
-                </button>
-              </div>
-              <div className="row">
-                <button className="btn" onClick={() => setShowQR(true)}>
-                  QR anzeigen
-                </button>
-                {"share" in navigator && (
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      navigator
-                        .share({
-                          title: "Celebeaty – hör mit",
-                          text: "Join my live session on Celebeaty",
-                          url: inviteLink,
-                        })
-                        .catch(() => {});
-                    }}
-                  >
-                    Systemteilen
-                  </button>
-                )}
-              </div>
+              <h3>Deine Zuhörer</h3>
+              <p style={{ marginTop: 4, color: "var(--sub)" }}>
+                Aktuell hören <b>{myFollowersCount}</b> {myFollowersCount === 1 ? "Person" : "Personen"} mit.
+              </p>
+              {myFollowersCount > 0 ? (
+                <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
+                  {myFollowersArr.slice(0, 6).map((f) => (
+                    <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div className="avatar">{(f.name || "?").slice(0, 1)}</div>
+                      <div style={{ fontWeight: 600 }}>{f.name || f.id}</div>
+                    </div>
+                  ))}
+                  {myFollowersCount > 6 && (
+                    <div style={{ color: "var(--sub)", fontSize: 13 }}>
+                      +{myFollowersCount - 6} weitere…
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="card muted" style={{ marginTop: 8 }}>
+                  <p>Noch niemand dabei – teile einfach weiter deine Musik.</p>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -398,26 +691,39 @@ export default function App() {
         {/* Receiver view */}
         {mode === "receiver" && (
           <div className="card">
-            <h2>Du hörst mit</h2>
-            {!recvNow && <p>Warte auf Song vom Sender…</p>}
-            {recvNow && <NowPlayingBox title="Gerade beim Empfänger" track={recvNow} />}
+            {!recvNow ? (
+              <>
+                <h2>Du hörst mit</h2>
+                <p>Du hörst gleich bei <b>{senderDisplay}</b> mit! Beim nächsten Song bist du dabei!</p>
+              </>
+            ) : (
+              <>
+                <h2>Du und <b>{senderDisplay}</b> hört gerade:</h2>
+                <NowPlayingBox
+                  title={recvNow.is_playing ? "Gerade beim Empfänger" : "Pausiert beim Empfänger"}
+                  track={recvNow}
+                  live={true}
+                  leaderTs={recvNow._leaderTs}
+                />
+                {!recvNow.is_playing && (
+                  <div style={{ color: "var(--sub)", marginTop: 8 }}>
+                    Sender hat pausiert – wir bleiben synchron.
+                  </div>
+                )}
+              </>
+            )}
             <div className="row">
               <button
                 className="btn"
-                onClick={async () => {
-                  if (!recvNow?.id) return alert("Noch kein Track empfangen.");
-                  try {
-                    await replayReceived(token, recvNow);
-                  } catch (e) {
-                    alert(e.message);
-                  }
-                }}
-              >
-                Erneut abspielen
-              </button>
-              <button
-                className="btn"
                 onClick={() => {
+                  if (followingUserId && me?.id && ws.current?.readyState === WebSocket.OPEN) {
+                    ws.current.send(JSON.stringify({
+                      type: "unfollow",
+                      targetUserId: followingUserId,
+                      user: { id: me.id, name: me.display_name },
+                      ts: nowTs(),
+                    }));
+                  }
                   setMode("idle");
                   setRecvNow(null);
                   setFollowingUserId(null);
@@ -455,29 +761,98 @@ export default function App() {
                       </div>
                       <div className="dot live" />
                     </div>
+
+                    {/* Track Preview */}
+                    {u.lastTrack ? (
+                      <div className="npBody" style={{ marginTop: 8 }}>
+                        {u.lastTrack.image && <img className="cover" src={u.lastTrack.image} alt="Album" />}
+                        <div className="meta">
+                          <div className="title">
+                            {u.lastTrack.name} {u.lastTrack.is_playing === false ? " • (Pausiert)" : ""}
+                          </div>
+                          <div className="artist">{(u.lastTrack.artists || []).join(", ")}</div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="meta" style={{ marginTop: 8, color: "var(--sub)" }}>
+                        Kein Track‑Preview (noch).
+                      </div>
+                    )}
+
                     <div className="roomActions">
-                      <button
-                        className="btn primary"
-                        onClick={() => {
-                          setFollowingUserId(u.id);
-                          setMode("receiver");
-                          setHint("Beim nächsten Ereignis starten wir automatisch.");
-                        }}
-                      >
-                        Mitspielen
-                      </button>
-                      <button
-                        className="btn"
-                        onClick={async () => {
-                          const link = buildFollowLink(u.id);
-                          try {
-                            await navigator.clipboard.writeText(link);
-                            setHint("Join-Link kopiert.");
-                          } catch {}
-                        }}
-                      >
-                        Link kopieren
-                      </button>
+                      {followingUserId === u.id ? (
+                        <>
+                          <button className="btn" disabled>Du hörst zu</button>
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              if (u.id && me?.id && ws.current?.readyState === WebSocket.OPEN) {
+                                ws.current.send(JSON.stringify({
+                                  type: "unfollow",
+                                  targetUserId: u.id,
+                                  user: { id: me.id, name: me.display_name },
+                                  ts: nowTs(),
+                                }));
+                              }
+                              setFollowingUserId(null);
+                              setMode("idle");
+                              setRecvNow(null);
+                            }}
+                          >
+                            Verlassen
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            className="btn primary"
+                            onClick={() => {
+                              if (followingUserId && me?.id && ws.current?.readyState === WebSocket.OPEN) {
+                                ws.current.send(JSON.stringify({
+                                  type: "unfollow",
+                                  targetUserId: followingUserId,
+                                  user: { id: me.id, name: me.display_name },
+                                  ts: nowTs(),
+                                }));
+                              }
+                              const newId = u.id;
+                              setFollowingUserId(newId);
+                              setMode("receiver");
+                              setHint("");
+
+                              if (me?.id && ws.current?.readyState === WebSocket.OPEN) {
+                                // follow
+                                ws.current.send(JSON.stringify({
+                                  type: "follow",
+                                  targetUserId: newId,
+                                  user: { id: me.id, name: me.display_name },
+                                  ts: nowTs(),
+                                }));
+                                // gezielt Snapshot anfordern
+                                ws.current.send(JSON.stringify({
+                                  type: "req_snapshot",
+                                  targetUserId: newId,
+                                  user: { id: me.id, name: me.display_name },
+                                  ts: nowTs(),
+                                }));
+                              }
+                            }}
+                          >
+                            Mithören
+                          </button>
+                          <button
+                            className="btn"
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(buildFollowLink(u.id));
+                                setHint("Join-Link kopiert.");
+                              } catch {}
+                            }}
+                          >
+                            Link kopieren
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -494,7 +869,7 @@ export default function App() {
                     onClick={() => {
                       setMode("sender");
                       setIsSharing(true);
-                      setHint("Teilen aktiv. Öffne Spotify und spiele einen Song.");
+                      setHint("Teilen aktiv. Öffne Spotify und spiele (oder pausiere) einen Song.");
                       if (ws.current?.readyState === WebSocket.OPEN && me?.id) {
                         ws.current.send(JSON.stringify({
                           type: "presence",
@@ -503,6 +878,7 @@ export default function App() {
                           ts: nowTs(),
                         }));
                       }
+                      hasSentInitialRef.current = false;
                     }}
                   >
                     Live teilen starten
@@ -515,87 +891,13 @@ export default function App() {
       </main>
 
       <Footer />
-
-      {/* ---- Menü (Header) ---- */}
-      {showMenu && (
-        <Menu onClose={() => setShowMenu(false)}>
-          <button className="menuItem" onClick={() => { window.location.href = `${BACKEND_URL}/force-login`; }}>
-            Mit anderem Account
-          </button>
-          <button className="menuItem" onClick={() => { setShowMenu(false); alert("Support: hello@celebeaty.com"); }}>
-            Support
-          </button>
-          <button
-            className="menuItem danger"
-            onClick={() => {
-              setShowMenu(false);
-              // Hard logout
-              setMode("idle");
-              setIsSharing(false);
-              setSenderNow(null);
-              setRecvNow(null);
-              setFollowingUserId(null);
-              setHint("");
-              setMe(null);
-              localStorage.removeItem("spotify_token");
-              window.location.href = "/";
-            }}
-          >
-            Abmelden
-          </button>
-        </Menu>
-      )}
-
-      {/* ---- Invite Modal ---- */}
-      {showInvite && (
-        <Modal onClose={() => setShowInvite(false)} title="Freunde einladen">
-          <p>Teile diesen Link, damit Freunde direkt deiner Session folgen:</p>
-          <div className="inviteRow">
-            <code className="inviteLink">{inviteLink}</code>
-            <button
-              className="btn primary"
-              onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(inviteLink);
-                  setHint("Einladungslink kopiert.");
-                } catch {}
-              }}
-            >
-              Link kopieren
-            </button>
-          </div>
-          <div className="row">
-            <button className="btn" onClick={() => setShowQR(true)}>QR anzeigen</button>
-            {"share" in navigator && (
-              <button
-                className="btn"
-                onClick={() => {
-                  navigator.share({ title: "Celebeaty – hör mit", url: inviteLink }).catch(() => {});
-                }}
-              >
-                Systemteilen
-              </button>
-            )}
-          </div>
-        </Modal>
-      )}
-
-      {/* ---- QR Modal ---- */}
-      {showQR && (
-        <Modal onClose={() => setShowQR(false)} title="QR‑Code">
-          <div className="qrWrap">
-            <img className="qrImg" src={qrUrl(inviteLink)} alt="QR" />
-          </div>
-          <p className="qrHint">Freunde scannen – sie joinen direkt deiner Session.</p>
-        </Modal>
-      )}
     </div>
   );
 }
 
 // ---------- UI Components ----------
 
-function Header({ me, onLogout, onOpenMenu, menuOpen }) {
+function Header({ me, onOpenMenu, menuOpen }) {
   return (
     <header className="header">
       <div className="brand">
@@ -607,7 +909,9 @@ function Header({ me, onLogout, onOpenMenu, menuOpen }) {
         <div className="user">
           <div className="avatar">{(me.display_name || "?").slice(0, 1)}</div>
           <span className="userName">{me.display_name}</span>
-          <button className="btn ghost" onClick={onOpenMenu}>{menuOpen ? "Schließen" : "Optionen"}</button>
+          <button className="btn ghost" onClick={onOpenMenu}>
+            {menuOpen ? "Schließen" : "Optionen"}
+          </button>
         </div>
       ) : (
         <a className="btn ghost" href={`${BACKEND_URL}/login`}>Login</a>
@@ -624,226 +928,82 @@ function Footer() {
   );
 }
 
-function NowPlayingBox({ title, track }) {
+/**
+ * NowPlayingBox
+ * - Wenn live=true und leaderTs gesetzt & track.is_playing, wird die Zeit
+ *   clientseitig alle 500ms hochgezählt (ohne neue Events).
+ */
+function NowPlayingBox({ title, track, live = false, leaderTs = null }) {
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!live || !track?.is_playing) return;
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [live, track?.is_playing, track?.id]);
+
+  // Fortschritt berechnen (Basis + verstrichene Zeit)
+  const progress = Math.max(
+    0,
+    (track?.progress_ms || 0) +
+      (live && track?.is_playing && leaderTs ? now - leaderTs : 0)
+  );
+
   return (
     <div className="np">
-      <div className="npHead">
-        <h3>{title}</h3>
-      </div>
+      <div className="npHead"><h3>{title}</h3></div>
       <div className="npBody">
         {track?.image && <img className="cover" src={track.image} alt="Album" />}
         <div className="meta">
           <div className="title">{track?.name || "Unbekannter Titel"}</div>
           <div className="artist">{(track?.artists || []).join(", ")}</div>
-          <div className="time">{msToMMSS(track?.progress_ms || 0)}</div>
+          <div className="time">{msToMMSS(progress)}</div>
         </div>
       </div>
     </div>
   );
 }
 
-function Menu({ children, onClose }) {
-  useEffect(() => {
-    const onEsc = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onEsc);
-    return () => window.removeEventListener("keydown", onEsc);
-  }, [onClose]);
-
-  return (
-    <div className="menuOverlay" onClick={onClose}>
-      <div className="menuSheet" onClick={(e) => e.stopPropagation()}>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function Modal({ title, children, onClose }) {
-  useEffect(() => {
-    const onEsc = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onEsc);
-    return () => window.removeEventListener("keydown", onEsc);
-  }, [onClose]);
-
-  return (
-    <div className="modalOverlay" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modalHead">
-          <h3>{title}</h3>
-          <button className="btn ghost" onClick={onClose}>Schließen</button>
-        </div>
-        <div className="modalBody">{children}</div>
-      </div>
-    </div>
-  );
-}
-
-// ---------- Logos (Ivory Luxe) ----------
-
+// ---------- Logos ----------
 function LogoMark() {
   return (
-    <svg
-      viewBox="0 0 140 140"
-      width="72"
-      height="72"
-      role="img"
-      aria-label="CB Logo"
-    >
+    <svg viewBox="0 0 140 140" width="72" height="72" role="img" aria-label="CB Logo">
       <defs>
-        {/* Champagne-Gradient wie im UI */}
         <linearGradient id="champ" x1="0" y1="0" x2="1" y2="1">
           <stop offset="0%" stopColor="#E9DCCB" />
           <stop offset="100%" stopColor="#D9C4A1" />
         </linearGradient>
-
-        {/* zarter Glanz */}
         <radialGradient id="gloss" cx="30%" cy="20%" r="60%">
           <stop offset="0%" stopColor="rgba(255,255,255,.65)" />
           <stop offset="60%" stopColor="rgba(255,255,255,.15)" />
           <stop offset="100%" stopColor="rgba(255,255,255,0)" />
         </radialGradient>
-
-        {/* sanfter Schatten */}
         <filter id="softShadow" x="-50%" y="-50%" width="200%" height="200%">
           <feDropShadow dx="0" dy="6" stdDeviation="6" floodOpacity="0.18" />
         </filter>
       </defs>
 
-      {/* Hintergrundkreis */}
-      <circle
-        cx="70"
-        cy="70"
-        r="64"
-        fill="url(#champ)"
-        stroke="#FFFFFF"
-        strokeOpacity=".4"
-        strokeWidth="2"
-        filter="url(#softShadow)"
-      />
-
-      {/* zarte Innenkante */}
-      <circle
-        cx="70"
-        cy="70"
-        r="50"
-        fill="none"
-        stroke="rgba(255,255,255,.35)"
-        strokeWidth="1.25"
-      />
-
-      {/* Glanz oben links */}
+      <circle cx="70" cy="70" r="64" fill="url(#champ)" stroke="#FFFFFF" strokeOpacity=".4" strokeWidth="2" filter="url(#softShadow)"/>
+      <circle cx="70" cy="70" r="50" fill="none" stroke="rgba(255,255,255,.35)" strokeWidth="1.25" />
       <circle cx="70" cy="70" r="64" fill="url(#gloss)" />
-
-      {/* Initialen CB */}
-      <text
-        x="50%"
-        y="50%"
-        dominantBaseline="middle"
-        textAnchor="middle"
-        fontFamily="'Roboto Condensed', Helvetica, Arial, sans-serif"
-        fontSize="54"
-        fontWeight="700"
-        letterSpacing="1.5"
-        fill="#2B2A27"
-      >
-        CB
-      </text>
+      <text className="logoMark" x="50%" y="50%" dominantBaseline="middle" textAnchor="middle" fontSize="54">CB</text>
     </svg>
   );
 }
-
-
-
 function LogoWord() {
   return (
     <div className="logoLarge">
       <svg viewBox="0 0 480 100" width="360" height="88" aria-hidden>
         <defs>
           <linearGradient id="champ2" x1="0" y1="0" x2="1" y2="1">
-            {/* kräftiger, dunklerer Gold-Verlauf */}
-            <stop offset="0%" stopColor="#D2B48C"/>
-            <stop offset="100%" stopColor="#A67C52"/>
+            <stop offset="0%" stopColor="#D2B48C" />
+            <stop offset="100%" stopColor="#A67C52" />
           </linearGradient>
         </defs>
-        <text
-          x="50%"
-          y="68"
-          textAnchor="middle"
-          fontFamily="Inter, ui-sans-serif"
-          fontSize="66"
-          fontWeight="900"
-          fill="url(#champ2)"
-        >
+        <text x="50%" y="68" textAnchor="middle" fontFamily="Inter, ui-sans-serif" fontSize="66" fontWeight="900" fill="url(#champ2)">
           Celebeaty
         </text>
       </svg>
     </div>
   );
-}
-
-
-// ---------- Playback Helpers (Receiver) ----------
-async function getDevices(token) {
-  const r = await fetch("https://api.spotify.com/v1/me/player/devices", {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!r.ok) return { devices: [] };
-  return r.json();
-}
-async function transferToDevice(token, deviceId, autoPlay = true) {
-  const r = await fetch("https://api.spotify.com/v1/me/player", {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ device_ids: [deviceId], play: autoPlay }),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Transfer-Fehler ${r.status}:\n${t.slice(0, 400)}`);
-  }
-}
-async function ensurePlaybackAndPlay(token, trackId, positionMs, setHint) {
-  try {
-    const devJson = await getDevices(token);
-    const devices = devJson.devices || [];
-    if (!devices.length) {
-      setHint?.("Kein Spotify‑Gerät verfügbar. Öffne Spotify beim Empfänger.");
-      return;
-    }
-    let device = devices.find((d) => d.is_active) || devices.find((d) => !d.is_restricted) || devices[0];
-
-    if (!device.is_active) {
-      await transferToDevice(token, device.id, true);
-      await new Promise((r) => setTimeout(r, 250));
-    }
-
-    const playRes = await fetch("https://api.spotify.com/v1/me/player/play", {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ uris: [`spotify:track:${trackId}`], position_ms: positionMs }),
-    });
-    if (!playRes.ok) {
-      const t = await playRes.text();
-      if (playRes.status === 403 || playRes.status === 404) {
-        setHint?.("Playback nicht möglich. Öffne Spotify und starte kurz manuell.");
-      } else {
-        setHint?.(`Playback-Fehler ${playRes.status}:\n${t.slice(0, 200)}`);
-      }
-    } else {
-      setHint?.("");
-    }
-  } catch (e) {
-    setHint?.("Fehler beim Starten der Wiedergabe. Öffne Spotify am Empfänger.");
-    console.warn(e);
-  }
-}
-async function replayReceived(token, recvNow) {
-  const r = await fetch("https://api.spotify.com/v1/me/player/play", {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ uris: [`spotify:track:${recvNow.id}`], position_ms: recvNow.progress_ms || 0 }),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Play-Fehler ${r.status}:\n${t.slice(0, 400)}`);
-  }
 }
