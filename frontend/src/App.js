@@ -6,8 +6,11 @@ import "./App.css";
  * - Single-Origin (bgrok/Prod): BACKEND_URL leer lassen → gleiche Origin
  * - Lokal getrennt: per REACT_APP_BACKEND_URL setzen
  */
+// Ganz oben in src/App.js
 const BACKEND_URL =
-  (typeof process !== "undefined" && process.env && process.env.REACT_APP_BACKEND_URL) || "";
+  (typeof process !== "undefined" && process.env && process.env.REACT_APP_BACKEND_URL) ||
+  (window.location.hostname.endsWith("vercel.app") ? "https://celebeaty.onrender.com" : "");
+
 
 // WebSocket-URL aus Backend/Origin bauen
 const WS_URL = (BACKEND_URL || window.location.origin).replace(
