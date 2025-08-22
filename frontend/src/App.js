@@ -172,7 +172,6 @@ export default function App() {
       try {
         const r = await fetch(`${BACKEND_URL}/whoami`, {
           credentials: "include",
-          headers: { "ngrok-skip-browser-warning": "true" },
         });
         if (!r.ok) throw new Error(`whoami status ${r.status}`);
         const j = await r.json();
@@ -449,7 +448,6 @@ export default function App() {
       try {
         const r = await fetch(`${BACKEND_URL}/currently-playing`, {
           credentials: "include",
-          headers: { "ngrok-skip-browser-warning": "true" },
         });
         const data = await r.json();
 
