@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build:public": "cd frontend && npm ci && npm run build && cd .. && rm -rf public && mkdir -p public && cp -r frontend/build/* public/"
+    "build:public": "npm run _build:frontend && rm -rf public && mkdir -p public && cp -a frontend/build/. public/",
+    "_build:frontend": "NPM_CONFIG_PRODUCTION=false npm --prefix frontend ci || (NPM_CONFIG_PRODUCTION=false npm --prefix frontend install && npm --prefix frontend audit fix --force || true);     NPM_CONFIG_PRODUCTION=false npm --prefix frontend run build"
   },
   "keywords": [],
   "author": "",
