@@ -7,17 +7,11 @@ import "./App.css";
  * - Lokal getrennt: per REACT_APP_BACKEND_URL setzen
  */
 // Ganz oben in src/App.js
-const BACKEND_URL =
-  (typeof process !== "undefined" && process.env && process.env.REACT_APP_BACKEND_URL) ||
-  (window.location.hostname.endsWith("vercel.app") ? "https://celebeaty.onrender.com" : "");
+// Frontend & Backend laufen auf derselben Origin → alle Calls relativ
+const BACKEND_URL = ""; // leer lassen → ergibt "/whoami", "/currently-playing", ...
 
-
-// WebSocket-URL aus Backend/Origin bauen
-const WS_BASE = (BACKEND_URL || window.location.origin).replace(
-  /^http(s?):/,
-  (m, s) => (s ? "wss:" : "ws:")
-);
-const WS_URL = WS_BASE.replace(/\/+$/, "") + "/ws";
+// Stabile WS-URL unter /ws (Server macht das Upgrade dorthin)
+const WS_URL = window.location.origin.replace(/^http/, "ws").replace(/\/+$/, "") + "/ws";
 
 // ---------- Helpers ----------
 function msToMMSS(ms = 0) {
@@ -52,12 +46,12 @@ function buildSenderSnapshot(me, senderNow) {
 
 // ---------- Playback via Backend-Proxys ----------
 async function getDevices() {
-  const r = await fetch(`${BACKEND_URL}/spotify/devices`, { credentials: "include" });
+  const r = await fetch(`/spotify/devices`, { credentials: "include" });
   if (!r.ok) return { devices: [] };
   return r.json();
 }
 async function transferToDevice(deviceId, autoPlay = true) {
-  const r = await fetch(`${BACKEND_URL}/spotify/transfer`, {
+  const r = await fetch(`/spotify/transfer`, {
     method: "PUT",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
@@ -69,7 +63,7 @@ async function transferToDevice(deviceId, autoPlay = true) {
   }
 }
 async function backendPlay({ uris, position_ms }) {
-  const r = await fetch(`${BACKEND_URL}/spotify/play`, {
+  const r = await fetch(`/spotify/play`, {
     method: "PUT",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
@@ -82,7 +76,7 @@ async function backendPlay({ uris, position_ms }) {
 }
 async function backendPause() {
   try {
-    await fetch(`${BACKEND_URL}/spotify/pause`, { method: "PUT", credentials: "include" });
+    await fetch(`/spotify/pause`, { method: "PUT", credentials: "include" });
   } catch {}
 }
 
@@ -171,9 +165,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch(`${BACKEND_URL}/whoami`, {
-          credentials: "include",
-        });
+        const r = await fetch(`/whoami`, { credentials: "include" });
         if (!r.ok) throw new Error(`whoami status ${r.status}`);
         const j = await r.json();
         const display = j.display_name || j.id || "Unbekannt";
@@ -447,9 +439,7 @@ export default function App() {
 
     const tick = async () => {
       try {
-        const r = await fetch(`${BACKEND_URL}/currently-playing`, {
-          credentials: "include",
-        });
+        const r = await fetch(`/currently-playing`, { credentials: "include" });
         const data = await r.json();
 
         // Heartbeat (Lobby sichtbar halten)
@@ -597,7 +587,7 @@ export default function App() {
             <h2>Login mit Spotify</h2>
             <p>Sieh, wer gerade teilt – oder starte deine eigene Live‑Session.</p>
             <div className="row">
-              <a className="btn primary" href={`${BACKEND_URL}/login`}>Login</a>
+              <a className="btn primary" href={`/login`}>Login</a>
             </div>
           </div>
         </main>
